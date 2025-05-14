@@ -17,6 +17,10 @@ export interface Env {
 	BUCKET: R2Bucket;
 }
 
+// Constants for Torrent Creation
+const TORRENT_PIECE_LENGTH = 262144; // 256 KiB
+const ANNOUNCE_URL = "udp://tracker.openbittorrent.com:6969/announce"; // Example public tracker
+
 export default {
 	async fetch(req: Request, env: Env): Promise<Response> {
 		const url = new URL(req.url);
@@ -56,6 +60,32 @@ export default {
 		const R2_PART_SIZE_LIMIT = 60 * 1024 * 1024;
 		let r2UploadBuffer: Uint8Array[] = [];
 		let r2UploadBufferSize = 0;
+
+		// State for Torrent Creation
+		let pieceHashes: Uint8Array[] = [];
+		let torrentPieceBufferArrays: Uint8Array[] = [];
+		let torrentPieceBufferCurrentSize = 0;
+		let totalZipSizeForTorrent = 0;
+
+		async function feedDataToTorrentHasher(data: Uint8Array) {
+			if (data.byteLength === 0) return;
+
+			torrentPieceBufferArrays.push(data);
+			torrentPieceBufferCurrentSize += data.length;
+			totalZipSizeForTorrent += data.length;
+
+			while (torrentPieceBufferCurrentSize >= TORRENT_PIECE_LENGTH) {
+				const consolidatedBuffer = concat(...torrentPieceBufferArrays);
+				const pieceData = consolidatedBuffer.slice(0, TORRENT_PIECE_LENGTH);
+				const remainder = consolidatedBuffer.slice(TORRENT_PIECE_LENGTH);
+
+				const hash = await sha1(pieceData); // sha1 helper is already defined
+				pieceHashes.push(hash);
+
+				torrentPieceBufferArrays = remainder.byteLength > 0 ? [remainder] : [];
+				torrentPieceBufferCurrentSize = remainder.byteLength;
+			}
+		}
 
 		async function addDataToR2Stream(data: Uint8Array) {
 			if (data.byteLength === 0) return; // Do not process empty chunks
@@ -100,6 +130,7 @@ export default {
 
 				const localFileHeaderBytes = makeLocalHeader(filenameForZip);
 				await addDataToR2Stream(localFileHeaderBytes);
+				await feedDataToTorrentHasher(localFileHeaderBytes);
 
 				let currentFileCrc = 0;
 				let currentFileRawLen = 0;
@@ -116,10 +147,12 @@ export default {
 					currentFileCrc = crc32(chunk, currentFileCrc);
 					currentFileRawLen += chunk.length;
 					await addDataToR2Stream(chunk);
+					await feedDataToTorrentHasher(chunk);
 				}
 
 				const dataDescriptorBytes = makeDataDescriptor(currentFileCrc, currentFileRawLen);
 				await addDataToR2Stream(dataDescriptorBytes);
+				await feedDataToTorrentHasher(dataDescriptorBytes);
 
 				centralDirectoryEntries.push({
 					filename: filenameForZip, crc: currentFileCrc,
@@ -143,6 +176,8 @@ export default {
 			const zipTail = concat(fullCentralDirectory, eocdBytes);
 			console.log(`Total Central Directory size: ${fullCentralDirectory.length}, EOCD size: ${eocdBytes.length}, ZIP Tail size: ${zipTail.length}`);
 
+			await feedDataToTorrentHasher(zipTail); // Feed zipTail to torrent hasher
+
 			const finalPartData = concat(remainingDataFromFiles, zipTail);
 
 			if (finalPartData.byteLength > 0) {
@@ -165,11 +200,55 @@ export default {
 			const finalArchiveUrl = `R2 object: ${combinedZipR2Key}`;
 			console.log(`Successfully created ZIP archive: ${finalArchiveUrl}`);
 
+			// --- Torrent File Creation and Upload ---
+			console.log("\n--- Creating and Uploading Torrent File ---");
+
+			// Hash any remaining data in the torrent piece buffer
+			if (torrentPieceBufferCurrentSize > 0) {
+				const lastPieceData = concat(...torrentPieceBufferArrays);
+				if (lastPieceData.byteLength > 0) {
+					const hash = await sha1(lastPieceData);
+					pieceHashes.push(hash);
+				}
+			}
+
+			const torrentInfoName = combinedZipR2Key.split('/').pop()!;
+			const torrentInfoDict = {
+				'name': torrentInfoName,
+				'piece length': TORRENT_PIECE_LENGTH,
+				'pieces': concat(...pieceHashes), // Produces a single Uint8Array
+				'length': totalZipSizeForTorrent
+			};
+
+			const torrentDataToEncode = {
+				'announce': ANNOUNCE_URL,
+				'info': torrentInfoDict
+			};
+
+			console.log("Torrent meta info (info.pieces omitted for brevity):", JSON.stringify({
+				announce: ANNOUNCE_URL,
+				info: {
+					name: torrentInfoDict.name,
+					'piece length': torrentInfoDict['piece length'],
+					length: torrentInfoDict.length,
+					piecesCount: pieceHashes.length
+				}
+			}, null, 2));
+
+			const bencodedTorrent = bencode.encode(torrentDataToEncode);
+			const torrentR2Key = `${combinedZipR2Key}.torrent`;
+
+			await env.BUCKET.put(torrentR2Key, bencodedTorrent, {
+				httpMetadata: { contentType: 'application/x-bittorrent' }
+			});
+			console.log(`Successfully created and uploaded torrent file: ${torrentR2Key}`);
+			// --- End of Torrent File Creation ---
+
 			return new Response(
 				`Successfully created ZIP archive: ${combinedZipR2Key}\n` +
 				`${centralDirectoryEntries.length} files included.\n` +
-				`Total archive size (approx, from final offset): ${currentGlobalOffset} bytes.\n` +
-				`Torrent creation deferred.`,
+				`Total archive size: ${totalZipSizeForTorrent} bytes.\n` + // Use totalZipSizeForTorrent
+				`Torrent file created: ${torrentR2Key}`,
 				{ headers: { "Content-Type": "text/plain" } }
 			);
 		} catch (error: any) {
