@@ -27,109 +27,143 @@ export default {
 		console.log("All search parameters:", url.searchParams.toString());
 
 		const rev = url.searchParams.get("rev") ?? "main";
-		const path = url.searchParams.get("path") ?? "config.json";
+		// const path = url.searchParams.get("path") ?? "config.json"; // Path will now come from API list
 
 		if (!repo) return new Response("missing ?repo=", { status: 400 });
 
-		const hfSrc = `https://huggingface.co/${repo}/resolve/${rev}/${path}`;
-		console.log("Constructed HuggingFace URL (hfSrc):", hfSrc);
+		// 1. Fetch file list from Hugging Face API
+		const hfApiUrl = `https://huggingface.co/api/models/${repo}/tree/${rev}`;
+		console.log("Constructed HuggingFace API URL for file list:", hfApiUrl);
 
-		// Fetch from HuggingFace
-		const upstream = await fetch(hfSrc, { cf: { cacheEverything: false } });
-		console.log("HuggingFace response status:", upstream.status, upstream.statusText);
+		const apiResponse = await fetch(hfApiUrl);
+		console.log("HuggingFace API response status:", apiResponse.status, apiResponse.statusText);
 
-		if (!upstream.ok) return new Response(`HF error: ${upstream.status} ${upstream.statusText}`, { status: 502 });
+		if (!apiResponse.ok) {
+			return new Response(`HF API error: ${apiResponse.status} ${apiResponse.statusText}`, { status: 502 });
+		}
 
-		const fname = path.split("/").pop()!;
-		const zipKey = `${repo}/${rev}/${fname}.zip`;
-		const pieceSize = 16 * 1024 * 1024; // 16 MiB pieces
+		const filesData = await apiResponse.json() as Array<{ path: string, type: string, size?: number }>;
+		// Filter out .git folder files, .gitattributes, and other common non-content files
+		const filePaths = filesData.filter(file =>
+			file.type === 'file' &&
+			!file.path.startsWith('.git') &&
+			!file.path.endsWith('.DS_Store')
+		).map(file => file.path);
 
-		// Tracking variables
-		const pieces: Uint8Array[] = [];
-		let pieceBuf = new Uint8Array(0);
-		let crc = 0;
-		let rawLen = 0;
-		let zipOffsetAfterLocalHeaderAndData = 0; // Tracks offset for central directory start
+		console.log("Files to be included in the ZIP:", filePaths);
 
-		// Start multipart upload
-		const mpu = await env.BUCKET.createMultipartUpload(zipKey);
-		const uploadedParts: R2UploadedPart[] = []; // Collect R2UploadedPart objects
+		if (filePaths.length === 0) {
+			return new Response(`No processable files found in ${repo} at revision ${rev}.`, { status: 404 });
+		}
 
-		// ZIP local header with data descriptor flag
-		const localHeader = makeLocalHeader(fname);
-		uploadedParts.push(await mpu.uploadPart(1, localHeader));
-		zipOffsetAfterLocalHeaderAndData += localHeader.length;
+		const centralDirectoryEntries: any[] = []; // To store { filename, crc, uncompressedSize, compressedSize, localHeaderOffset }
+		let currentGlobalOffset = 0;
+		const combinedZipR2Key = `${repo}/${rev}/archive.zip`;
 
-		// Stream processing
-		let partIdx = 2;
-		let partSize = 0;
-		let partBuf: Uint8Array[] = [];
+		const mpu = await env.BUCKET.createMultipartUpload(combinedZipR2Key);
+		const uploadedParts: R2UploadedPart[] = [];
+		let activeR2PartBuffer: Uint8Array[] = [];
+		let activeR2PartSize = 0;
+		let r2PartIndex = 1;
+		const R2_PART_SIZE_LIMIT = 60 * 1024 * 1024; // Slightly less than 64MB for safety
 
-		for await (const chunk of upstream.body!) {
-			// Update CRC32 of uncompressed data
-			crc = crc32(chunk, crc);
-			rawLen += chunk.length;
+		async function streamChunkToR2(dataChunk: Uint8Array) {
+			activeR2PartBuffer.push(dataChunk);
+			activeR2PartSize += dataChunk.length;
+			currentGlobalOffset += dataChunk.length;
 
-			// Accumulate for piece hashing
-			pieceBuf = concat(pieceBuf, chunk);
-			while (pieceBuf.length >= pieceSize) {
-				const piece = pieceBuf.slice(0, pieceSize);
-				pieces.push(await sha1(piece));
-				pieceBuf = pieceBuf.slice(pieceSize);
+			while (activeR2PartSize >= R2_PART_SIZE_LIMIT && activeR2PartBuffer.length > 0) {
+				const bufferToUpload = concat(...activeR2PartBuffer);
+				let chunkToUpload: Uint8Array;
+
+				if (bufferToUpload.length > R2_PART_SIZE_LIMIT) {
+					chunkToUpload = bufferToUpload.slice(0, R2_PART_SIZE_LIMIT);
+					activeR2PartBuffer = [bufferToUpload.slice(R2_PART_SIZE_LIMIT)];
+					activeR2PartSize = activeR2PartBuffer[0].length;
+				} else {
+					chunkToUpload = bufferToUpload;
+					activeR2PartBuffer = [];
+					activeR2PartSize = 0;
+				}
+				console.log(`Uploading R2 part ${r2PartIndex} with size ${chunkToUpload.byteLength}`);
+				try {
+					uploadedParts.push(await mpu.uploadPart(r2PartIndex++, chunkToUpload));
+				} catch (e: any) {
+					console.error(`Error uploading R2 part ${r2PartIndex - 1}:`, e.message, e.stack);
+					// Decide on error handling: rethrow, or try to mark MPU for abort later?
+					throw e; // Rethrow for now
+				}
+			}
+		}
+
+		for (const path of filePaths) {
+			console.log(`\n--- Adding file to ZIP stream: ${path} ---`);
+			const filenameForZip = path.split("/").pop()!;
+			const localHeaderFileOffset = currentGlobalOffset;
+
+			const localFileHeaderBytes = makeLocalHeader(filenameForZip);
+			await streamChunkToR2(localFileHeaderBytes);
+
+			let currentFileCrc = 0;
+			let currentFileRawLen = 0;
+
+			const hfSrc = `https://huggingface.co/${repo}/resolve/${rev}/${path}`;
+			const upstream = await fetch(hfSrc, { cf: { cacheEverything: false } });
+
+			if (!upstream.ok || !upstream.body) {
+				console.error(`Failed to fetch or get body for ${path}: ${upstream.status}`);
+				// Skip this file or abort? For now, log and skip.
+				continue;
+			}
+			console.log(`Streaming content for ${path}...`);
+			for await (const chunk of upstream.body) {
+				currentFileCrc = crc32(chunk, currentFileCrc);
+				currentFileRawLen += chunk.length;
+				await streamChunkToR2(chunk);
 			}
 
-			// Add to multipart buffer
-			partBuf.push(chunk);
-			partSize += chunk.length;
-			// zipOffsetAfterLocalHeaderAndData is updated *after* all file data is processed
+			const dataDescriptorBytes = makeDataDescriptor(currentFileCrc, currentFileRawLen);
+			await streamChunkToR2(dataDescriptorBytes);
 
-			// Upload part when buffer is large enough
-			if (partSize >= 64 * 1024 * 1024) {
-				const currentPartData = concat(...partBuf);
-				uploadedParts.push(await mpu.uploadPart(partIdx++, currentPartData));
-				partBuf = [];
-				partSize = 0;
+			centralDirectoryEntries.push({
+				filename: filenameForZip,
+				crc: currentFileCrc,
+				uncompressedSize: currentFileRawLen,
+				compressedSize: currentFileRawLen, // Assuming store-only (no compression)
+				localHeaderOffset: localHeaderFileOffset
+			});
+			console.log(`Finished adding ${path} to ZIP stream. Size: ${currentFileRawLen}, CRC: ${currentFileCrc}`);
+		}
+
+		// After all files, if there's remaining data in the buffer, upload it as the last part for file data section.
+		if (activeR2PartSize > 0) {
+			const finalDataChunk = concat(...activeR2PartBuffer);
+			console.log(`Uploading final R2 part ${r2PartIndex} with size ${finalDataChunk.byteLength}`);
+			try {
+				uploadedParts.push(await mpu.uploadPart(r2PartIndex++, finalDataChunk));
+			} catch (e: any) {
+				console.error(`Error uploading final R2 part ${r2PartIndex - 1}:`, e.message, e.stack);
+				throw e;
 			}
 		}
-		zipOffsetAfterLocalHeaderAndData += rawLen; // Now add total rawLen
 
-		// Handle remaining data
-		if (pieceBuf.length) {
-			pieces.push(await sha1(pieceBuf));
+		console.log("\n--- All file data streamed to R2 parts --- Succeeded Parts:", uploadedParts.length);
+		console.log("Collected Central Directory Entries:", JSON.stringify(centralDirectoryEntries, null, 2));
+		console.log("Current Global Offset (expected start of Central Directory):", currentGlobalOffset);
+
+		// --- DEFERRED: Construct Central Directory, EOCD, upload them, complete MPU, create torrent ---
+		// For now, we will abort the MPU to avoid incomplete uploads during this dev phase.
+		if (mpu) {
+			console.log("Aborting MPU as Central Directory generation is not yet implemented.");
+			await mpu.abort();
 		}
-		if (partSize > 0) {
-			const finalPartData = concat(...partBuf);
-			uploadedParts.push(await mpu.uploadPart(partIdx++, finalPartData));
-		}
 
-		// Data descriptor
-		const dataDesc = makeDataDescriptor(crc, rawLen);
-		uploadedParts.push(await mpu.uploadPart(partIdx++, dataDesc));
-		const offsetStartOfCentralDirectory = zipOffsetAfterLocalHeaderAndData + dataDesc.length;
-
-		// Central directory and EOCD
-		const centralDir = makeCentralDirectory(fname, crc, rawLen, 0); // Offset of local header is 0
-		const eocd = makeEOCD(centralDir.length, offsetStartOfCentralDirectory, 1);
-		uploadedParts.push(await mpu.uploadPart(partIdx++, concat(centralDir, eocd)));
-
-		// Complete multipart upload
-		await mpu.complete(uploadedParts); // Pass collected parts
-
-		// Create and store torrent
-		const finalZipLength = offsetStartOfCentralDirectory + centralDir.length + eocd.length;
-		const info = {
-			"name": `${fname}.zip`,
-			"length": finalZipLength,
-			"piece length": pieceSize,
-			"pieces": Buffer.concat(pieces) // Assumes Buffer is available via nodejs_compat
-		};
-
-		const torrent = bencode.encode(info);
-
-		await env.BUCKET.put(`${zipKey}.torrent`, torrent);
-
-		return new Response(`Success: ${zipKey}
-Pieces: ${pieces.length}`);
+		return new Response(
+			`All file data parts streamed. Central Directory construction and MPU completion deferred.\n` +
+			`Collected ${centralDirectoryEntries.length} entries for Central Directory.\n` +
+			`Total bytes streamed (excluding future CD/EOCD): ${currentGlobalOffset}`,
+			{ headers: { "Content-Type": "text/plain" } }
+		);
 	}
 };
 
@@ -172,73 +206,6 @@ function makeDataDescriptor(crc: number, size: number): Uint8Array {
 	return desc;
 }
 
-function makeCentralDirectory(filename: string, crc: number, size: number, offsetLocalHeader: number): Uint8Array { // Added offsetLocalHeader
-	const utf8Name = new TextEncoder().encode(filename);
-	const central = new Uint8Array(46 + utf8Name.length);
-	const view = new DataView(central.buffer);
-
-	// Central directory signature
-	view.setUint32(0, 0x02014b50, true);
-	// Version made by
-	view.setUint16(4, 0x031e, true); // Using a common value, like 0x031e for PKZip 2.0 made by MS-DOS
-	// Version needed to extract
-	view.setUint16(6, 0x0014, true); // 2.0
-	// General purpose bit flag
-	view.setUint16(8, 0x0008, true); // Bit 3 for data descriptor
-	// Compression method
-	view.setUint16(10, 0, true); // 0 = store
-	// Last mod file time & date (can be zeroed)
-	view.setUint16(12, 0, true);
-	view.setUint16(14, 0, true);
-	// CRC-32
-	view.setUint32(16, crc, true);
-	// Compressed size
-	view.setUint32(20, size, true);
-	// Uncompressed size
-	view.setUint32(24, size, true);
-	// File name length
-	view.setUint16(28, utf8Name.length, true);
-	// Extra field length
-	view.setUint16(30, 0, true);
-	// File comment length
-	view.setUint16(32, 0, true);
-	// Disk number start
-	view.setUint16(34, 0, true);
-	// Internal file attributes
-	view.setUint16(36, 0, true);
-	// External file attributes
-	view.setUint32(38, 0, true);
-	// Relative offset of local header
-	view.setUint32(42, offsetLocalHeader, true);
-
-	central.set(utf8Name, 46);
-	return central;
-}
-
-function makeEOCD(centralDirSize: number, centralDirOffset: number, numEntries: number): Uint8Array {
-	const eocd = new Uint8Array(22);
-	const view = new DataView(eocd.buffer);
-
-	// End of central directory signature
-	view.setUint32(0, 0x06054b50, true);
-	// Number of this disk
-	view.setUint16(4, 0, true);
-	// Disk where central directory starts
-	view.setUint16(6, 0, true);
-	// Number of entries in central directory on this disk
-	view.setUint16(8, numEntries, true);
-	// Total number of entries in central directory
-	view.setUint16(10, numEntries, true);
-	// Size of central directory
-	view.setUint32(12, centralDirSize, true);
-	// Offset of start of central directory, relative to start of archive
-	view.setUint32(16, centralDirOffset, true);
-	// ZIP file comment length
-	view.setUint16(20, 0, true);
-
-	return eocd;
-}
-
 function concat(...arrays: Uint8Array[]): Uint8Array {
 	const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
 	const result = new Uint8Array(totalLength);
@@ -248,11 +215,6 @@ function concat(...arrays: Uint8Array[]): Uint8Array {
 		offset += arr.length;
 	}
 	return result;
-}
-
-async function sha1(data: Uint8Array): Promise<Uint8Array> {
-	const hash = await crypto.subtle.digest('SHA-1', data);
-	return new Uint8Array(hash);
 }
 
 function crc32(data: Uint8Array, crc: number = 0): number {
