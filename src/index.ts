@@ -26,12 +26,19 @@ export default {
 		const url = new URL(req.url);
 		console.log("Received req.url:", req.url);
 
-		const repo = url.searchParams.get("repo");
-		const rev = "main";
+		const repoParam = url.searchParams.get("repo"); // e.g., "dennisjooo/Birds-Classifier-EfficientNetB2"
+		const rev = "main"; // Hardcoded as per previous steps
 
-		if (!repo) return new Response("missing ?repo=", { status: 400 });
+		if (!repoParam) return new Response("missing ?repo=", { status: 400 });
 
-		const hfApiUrl = `https://huggingface.co/api/models/${repo}/tree/${rev}`;
+		const repoParts = repoParam.split('/');
+		if (repoParts.length < 2) {
+			return new Response("Invalid ?repo= format. Expected 'username/repository_name'.", { status: 400 });
+		}
+		const username = repoParts[0];
+		const repoNameOnly = repoParts.slice(1).join('/'); // Handles cases where repo name might have slashes, though typically not.
+
+		const hfApiUrl = `https://huggingface.co/api/models/${repoParam}/tree/${rev}`;
 		const apiResponse = await fetch(hfApiUrl);
 		if (!apiResponse.ok) {
 			return new Response(`HF API error fetching file list: ${apiResponse.status} ${apiResponse.statusText}`, { status: 502 });
@@ -46,14 +53,18 @@ export default {
 
 		console.log("Files to be included in the ZIP:", filePaths);
 		if (filePaths.length === 0) {
-			return new Response(`No processable files found in ${repo} at revision ${rev}.`, { status: 404 });
+			return new Response(`No processable files found in ${repoParam} at revision ${rev}.`, { status: 404 });
 		}
 
 		const centralDirectoryEntries: any[] = [];
 		let currentGlobalOffset = 0;
-		const combinedZipR2Key = `${repo}/${rev}/archive.zip`;
 
-		const mpu = await env.BUCKET.createMultipartUpload(combinedZipR2Key);
+		const finalZipR2Key = `${username}/${repoNameOnly}.zip`;
+		console.log(`Target R2 key for ZIP: ${finalZipR2Key}`);
+
+		const mpu = await env.BUCKET.createMultipartUpload(finalZipR2Key, {
+			httpMetadata: { contentType: 'application/zip' }
+		});
 		const uploadedParts: R2UploadedPart[] = [];
 
 		let r2PartIndex = 1;
@@ -88,7 +99,7 @@ export default {
 		}
 
 		async function addDataToR2Stream(data: Uint8Array) {
-			if (data.byteLength === 0) return; // Do not process empty chunks
+			if (data.byteLength === 0) return;
 
 			r2UploadBuffer.push(data);
 			r2UploadBufferSize += data.length;
@@ -135,7 +146,7 @@ export default {
 				let currentFileCrc = 0;
 				let currentFileRawLen = 0;
 
-				const hfSrc = `https://huggingface.co/${repo}/resolve/${rev}/${path}`;
+				const hfSrc = `https://huggingface.co/${repoParam}/resolve/${rev}/${path}`;
 				const upstream = await fetch(hfSrc, { cf: { cacheEverything: false } });
 
 				if (!upstream.ok || !upstream.body) {
@@ -162,7 +173,8 @@ export default {
 				console.log(`Finished processing ${path}. Size: ${currentFileRawLen}, CRC: ${currentFileCrc}`);
 			}
 
-			const remainingDataFromFiles = await flushRemainingR2Stream();
+			const remainingDataFromFilesBuffer = await flushRemainingR2Stream();
+			await feedDataToTorrentHasher(remainingDataFromFilesBuffer);
 
 			console.log("\n--- Constructing ZIP Tail (Central Directory & EOCD) ---");
 			const startOfCentralDirectoryOffset = currentGlobalOffset;
@@ -176,13 +188,13 @@ export default {
 			const zipTail = concat(fullCentralDirectory, eocdBytes);
 			console.log(`Total Central Directory size: ${fullCentralDirectory.length}, EOCD size: ${eocdBytes.length}, ZIP Tail size: ${zipTail.length}`);
 
-			await feedDataToTorrentHasher(zipTail); // Feed zipTail to torrent hasher
+			await feedDataToTorrentHasher(zipTail);
 
-			const finalPartData = concat(remainingDataFromFiles, zipTail);
+			const finalR2UploadData = concat(remainingDataFromFilesBuffer, zipTail);
 
-			if (finalPartData.byteLength > 0) {
-				console.log(`Uploading final R2 part ${r2PartIndex} (Combined remaining file data + ZIP Tail) with size ${finalPartData.byteLength}`);
-				uploadedParts.push(await mpu.uploadPart(r2PartIndex++, finalPartData));
+			if (finalR2UploadData.byteLength > 0) {
+				console.log(`Uploading final R2 part ${r2PartIndex} (Combined remaining file data + ZIP Tail) to ${finalZipR2Key} with size ${finalR2UploadData.byteLength}`);
+				uploadedParts.push(await mpu.uploadPart(r2PartIndex++, finalR2UploadData));
 			} else if (uploadedParts.length === 0) {
 				console.warn("Final part data is zero bytes and no other parts were uploaded. Aborting MPU.");
 				await mpu.abort();
@@ -196,9 +208,7 @@ export default {
 			console.log("Parts for MPU complete:", JSON.stringify(uploadedParts.map(p => ({ partNumber: p.partNumber, etag: p.etag })), null, 2));
 
 			await mpu.complete(uploadedParts);
-
-			const finalArchiveUrl = `R2 object: ${combinedZipR2Key}`;
-			console.log(`Successfully created ZIP archive: ${finalArchiveUrl}`);
+			console.log(`Successfully created ZIP archive: ${finalZipR2Key}`);
 
 			// --- Torrent File Creation and Upload ---
 			console.log("\n--- Creating and Uploading Torrent File ---");
@@ -212,21 +222,26 @@ export default {
 				}
 			}
 
-			const torrentInfoName = combinedZipR2Key.split('/').pop()!;
+			const torrentInfoName = `${repoNameOnly}.zip`; // Name based on repoNameOnly
 			const torrentInfoDict = {
 				'name': torrentInfoName,
 				'piece length': TORRENT_PIECE_LENGTH,
-				'pieces': concat(...pieceHashes), // Produces a single Uint8Array
+				'pieces': concat(...pieceHashes),
 				'length': totalZipSizeForTorrent
 			};
 
+			const webseedUrl = `https://gerbil.muggingface.co/${username}/${repoNameOnly}.zip`; // Webseed URL based on username/repoNameOnly
+			console.log(`Using webseed URL: ${webseedUrl}`);
+
 			const torrentDataToEncode = {
 				'announce': ANNOUNCE_URL,
-				'info': torrentInfoDict
+				'info': torrentInfoDict,
+				'url-list': [webseedUrl]
 			};
 
-			console.log("Torrent meta info (info.pieces omitted for brevity):", JSON.stringify({
+			console.log("Torrent meta info (info.pieces omitted for brevity, url-list added):", JSON.stringify({
 				announce: ANNOUNCE_URL,
+				'url-list': [webseedUrl],
 				info: {
 					name: torrentInfoDict.name,
 					'piece length': torrentInfoDict['piece length'],
@@ -236,7 +251,7 @@ export default {
 			}, null, 2));
 
 			const bencodedTorrent = bencode.encode(torrentDataToEncode);
-			const torrentR2Key = `${combinedZipR2Key}.torrent`;
+			const torrentR2Key = `${username}/${repoNameOnly}.torrent`; 
 
 			await env.BUCKET.put(torrentR2Key, bencodedTorrent, {
 				httpMetadata: { contentType: 'application/x-bittorrent' }
@@ -245,9 +260,9 @@ export default {
 			// --- End of Torrent File Creation ---
 
 			return new Response(
-				`Successfully created ZIP archive: ${combinedZipR2Key}\n` +
+				`Successfully created ZIP archive: ${finalZipR2Key}\n` +
 				`${centralDirectoryEntries.length} files included.\n` +
-				`Total archive size: ${totalZipSizeForTorrent} bytes.\n` + // Use totalZipSizeForTorrent
+				`Total archive size: ${totalZipSizeForTorrent} bytes.\n` +
 				`Torrent file created: ${torrentR2Key}`,
 				{ headers: { "Content-Type": "text/plain" } }
 			);
