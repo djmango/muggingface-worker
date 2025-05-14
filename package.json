@@ -11,9 +11,13 @@
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.8.19",
+		"@types/bencode": "^2.0.4",
 		"@types/node": "^22.15.18",
 		"typescript": "^5.5.2",
 		"vitest": "~3.0.7",
 		"wrangler": "^4.14.4"
+	},
+	"dependencies": {
+		"bencode": "^4.0.0"
 	}
 }
