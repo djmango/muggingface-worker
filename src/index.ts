@@ -1,16 +1,3 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
-
 import bencode from "bencode";
 
 export interface Env {
@@ -18,7 +5,7 @@ export interface Env {
 }
 
 // Constants for Torrent Creation
-const TORRENT_PIECE_LENGTH = 262144; // 256 KiB
+const TORRENT_PIECE_LENGTH = 1_048_576; // 1MiB
 const ANNOUNCE_URL = "udp://tracker.openbittorrent.com:6969/announce"; // Example public tracker
 
 export default {
@@ -46,10 +33,10 @@ export default {
 
 		const filesData = await apiResponse.json() as Array<{ path: string, type: string, size?: number }>;
 		const filePaths = filesData.filter(file =>
-			file.type === 'file' &&
-			!file.path.startsWith('.git') && 
-			!file.path.endsWith('.DS_Store')
+			file.type === 'file'
 		).map(file => file.path);
+		// Log all the non-file types
+		console.log("Non-file types found:", filesData.filter(file => file.type !== 'file').map(file => file.type));
 
 		console.log("Files to be included in the ZIP:", filePaths);
 		if (filePaths.length === 0) {
@@ -230,17 +217,17 @@ export default {
 				'length': totalZipSizeForTorrent
 			};
 
-			const webseedUrl = `https://gerbil.muggingface.co/${username}/${repoNameOnly}.zip`; // Webseed URL based on username/repoNameOnly
+			const webseedUrl = `https://gerbil.muggingface.co/${username}/${repoNameOnly}.zip`;
 			console.log(`Using webseed URL: ${webseedUrl}`);
 
-			const torrentDataToEncode = {
+			const torrentDataToEncode: any = { // Type as any to allow dynamic key removal if needed, or ensure optional announce
 				'announce': ANNOUNCE_URL,
 				'info': torrentInfoDict,
-				'url-list': [webseedUrl]
+				'url-list': [webseedUrl],
+				'encoding': 'utf-8'
 			};
 
-			console.log("Torrent meta info (info.pieces omitted for brevity, url-list added):", JSON.stringify({
-				announce: ANNOUNCE_URL,
+			console.log("Torrent meta info (trackerless, info.pieces omitted for brevity, url-list added):", JSON.stringify({
 				'url-list': [webseedUrl],
 				info: {
 					name: torrentInfoDict.name,
