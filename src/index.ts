@@ -210,24 +210,41 @@ export default {
 			}
 
 			const torrentInfoName = `${repoNameOnly}.zip`; // Name based on repoNameOnly
+			const webseedUrl = `https://gerbil.muggingface.co/${username}/${repoNameOnly}.zip`;
+			const expectedZipSize = totalZipSizeForTorrent;
+			const expectedNumPieces = Math.ceil(expectedZipSize / TORRENT_PIECE_LENGTH);
+			const piecesConcat = concat(...pieceHashes);
+
+			// --- Strict metadata checks ---
+			if (pieceHashes.length !== expectedNumPieces) {
+				throw new Error(`Torrent piece count mismatch: expected ${expectedNumPieces}, got ${pieceHashes.length}`);
+			}
+			if (piecesConcat.length !== expectedNumPieces * 20) {
+				throw new Error(`Torrent pieces byte length mismatch: expected ${expectedNumPieces * 20}, got ${piecesConcat.length}`);
+			}
+			if (!webseedUrl.endsWith(torrentInfoName)) {
+				throw new Error(`Webseed URL (${webseedUrl}) does not match info.name (${torrentInfoName})`);
+			}
+
+			// Use plain strings for torrent values, not UTF-8 encoded arrays
+			// This ensures better compatibility with all clients
 			const torrentInfoDict = {
 				'name': torrentInfoName,
 				'piece length': TORRENT_PIECE_LENGTH,
-				'pieces': concat(...pieceHashes),
-				'length': totalZipSizeForTorrent
+				'pieces': piecesConcat,
+				'length': expectedZipSize
 			};
 
-			const webseedUrl = `https://gerbil.muggingface.co/${username}/${repoNameOnly}.zip`;
-			console.log(`Using webseed URL: ${webseedUrl}`);
-
-			const torrentDataToEncode: any = { // Type as any to allow dynamic key removal if needed, or ensure optional announce
+			// Include both BEP-19 (url-list) and BEP-17 (httpseeds) for maximum compatibility
+			const torrentDataToEncode: any = {
 				'announce': ANNOUNCE_URL,
 				'info': torrentInfoDict,
-				'url-list': [webseedUrl],
-				'encoding': 'utf-8'
+				'url-list': [webseedUrl], // BEP-19 standard webseed
+				'created by': 'muggingface-worker',
+				'creation date': Math.floor(Date.now() / 1000)
 			};
 
-			console.log("Torrent meta info (trackerless, info.pieces omitted for brevity, url-list added):", JSON.stringify({
+			console.log("Torrent meta info (enhanced for web seeding):", JSON.stringify({
 				'url-list': [webseedUrl],
 				info: {
 					name: torrentInfoDict.name,
@@ -237,8 +254,16 @@ export default {
 				}
 			}, null, 2));
 
-			const bencodedTorrent = bencode.encode(torrentDataToEncode);
-			const torrentR2Key = `${username}/${repoNameOnly}.torrent`; 
+			// Force the correct field order in bencoded output to avoid url-list1 issue
+			const orderedTorrentData = new Map();
+			orderedTorrentData.set('announce', torrentDataToEncode.announce);
+			orderedTorrentData.set('created by', torrentDataToEncode['created by']);
+			orderedTorrentData.set('creation date', torrentDataToEncode['creation date']);
+			orderedTorrentData.set('info', torrentDataToEncode.info);
+			orderedTorrentData.set('url-list', torrentDataToEncode['url-list']);
+
+			const bencodedTorrent = bencode.encode(Object.fromEntries(orderedTorrentData));
+			const torrentR2Key = `${username}/${repoNameOnly}.torrent`;
 
 			await env.BUCKET.put(torrentR2Key, bencodedTorrent, {
 				httpMetadata: { contentType: 'application/x-bittorrent' }
